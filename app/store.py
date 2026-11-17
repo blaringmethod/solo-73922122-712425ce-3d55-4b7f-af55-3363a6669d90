@@ -9,6 +9,7 @@ round a no-op for readers of the published catalogue.
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 import threading
 import uuid
@@ -23,6 +24,19 @@ def utc_now_millis() -> str:
         .isoformat(timespec="milliseconds")
         .replace("+00:00", "Z")
     )
+
+
+def split_creators(creator: str | None) -> list[str]:
+    """Split a stored creator field into individual attribution strings.
+
+    The harvester stores ``dc:creator`` values joined by ``"; "``; each
+    non-empty segment is one attribution occurrence, addressed by its
+    position (0-based) in this list.  Splitting never merges or reorders:
+    two identical names stay two distinct occurrences.
+    """
+    if not creator:
+        return []
+    return [part.strip() for part in creator.split(";") if part.strip()]
 
 
 class Store:
@@ -101,6 +115,32 @@ class Store:
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_catalog_title ON catalog(title);
+
+                -- 署名归并：人物编号。人物不按姓名自动合并，只由人工归并产生。
+                CREATE TABLE IF NOT EXISTS persons (
+                    id TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                -- 一处署名（某条已发布书目的某个序位）只归一人。
+                -- 归属只指向已发布目录；成功采集提交时在同一事务里调和：
+                -- 序位与文字都未变的归属保留，其余解除；撤回即全部解除。
+                CREATE TABLE IF NOT EXISTS attributions (
+                    identifier TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    name_text TEXT NOT NULL,
+                    person_id TEXT NOT NULL,
+                    assigned_at TEXT NOT NULL,
+                    PRIMARY KEY (identifier, position),
+                    FOREIGN KEY (person_id) REFERENCES persons(id)
+                        ON DELETE CASCADE,
+                    FOREIGN KEY (identifier) REFERENCES catalog(identifier)
+                        ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_attributions_person
+                    ON attributions(person_id);
 
                 INSERT OR IGNORE INTO published_state
                     (id, watermark, updated_at, success_count, last_run_id)
@@ -441,6 +481,35 @@ class Store:
         if self._meta_get("active_run_id") == run_id:
             self._meta_set("active_run_id", None)
 
+    def _reconcile_attributions(
+        self, identifier: str, old_creator: str | None, new_creator: str | None
+    ) -> None:
+        """Drop assignments whose position/text did not survive an update.
+
+        Called inside the commit transaction.  An assignment survives only
+        when the same position holds exactly the same text before and after
+        the harvest; a renamed, reordered or truncated author list releases
+        the affected positions.  A brand-new record keeps nothing.
+        """
+        old_parts = split_creators(old_creator)
+        new_parts = split_creators(new_creator)
+        kept = {
+            position
+            for position, (old, new) in enumerate(zip(old_parts, new_parts))
+            if old == new
+        }
+        rows = self._conn.execute(
+            "SELECT position FROM attributions WHERE identifier = ?",
+            (identifier,),
+        ).fetchall()
+        for row in rows:
+            if row["position"] not in kept:
+                self._conn.execute(
+                    "DELETE FROM attributions "
+                    "WHERE identifier = ? AND position = ?",
+                    (identifier, row["position"]),
+                )
+
     def commit_run(self, run_id: str) -> dict[str, Any]:
         """Atomically publish staging and advance the watermark.
 
@@ -479,12 +548,21 @@ class Store:
                 deletions = 0
                 for row in rows:
                     if row["deleted"]:
+                        # 撤回：目录行与它的全部署名归属一起消失。
+                        self._conn.execute(
+                            "DELETE FROM attributions WHERE identifier = ?",
+                            (row["identifier"],),
+                        )
                         self._conn.execute(
                             "DELETE FROM catalog WHERE identifier = ?",
                             (row["identifier"],),
                         )
                         deletions += 1
                     else:
+                        previous = self._conn.execute(
+                            "SELECT creator FROM catalog WHERE identifier = ?",
+                            (row["identifier"],),
+                        ).fetchone()
                         self._conn.execute(
                             """
                             INSERT INTO catalog
@@ -504,6 +582,13 @@ class Store:
                                 row["datestamp"],
                                 now,
                             ),
+                        )
+                        # 作者顺序或姓名被本轮改动时，只保留序位与文字
+                        # 都未变的归属；未变化的署名归属原样保留。
+                        self._reconcile_attributions(
+                            row["identifier"],
+                            previous["creator"] if previous else None,
+                            row["creator"],
                         )
                         upserts += 1
 
@@ -649,6 +734,250 @@ class Store:
                 "pages": pages,
                 "query": query,
             }
+
+    # ---------------------------------------------------------------- people
+    # 署名归并：把已发布书目的署名（按分号拆分后的某一序位）人工归到人物编号。
+    # 版本令牌覆盖归并页展示的全部数据（目录、人物、归属），提交时逐项核对，
+    # 过期提交一律拒绝。
+
+    def _merge_version_locked(self) -> str:
+        digest = hashlib.sha256()
+        for row in self._conn.execute(
+            "SELECT identifier, title, creator FROM catalog ORDER BY identifier"
+        ):
+            digest.update(
+                "\x1f".join(
+                    [row["identifier"], row["title"] or "", row["creator"] or ""]
+                ).encode("utf-8")
+            )
+            digest.update(b"\x1e")
+        for row in self._conn.execute(
+            "SELECT id, display_name FROM persons ORDER BY id"
+        ):
+            digest.update(
+                "\x1f".join([row["id"], row["display_name"]]).encode("utf-8")
+            )
+            digest.update(b"\x1e")
+        for row in self._conn.execute(
+            "SELECT identifier, position, name_text, person_id FROM attributions "
+            "ORDER BY identifier, position"
+        ):
+            digest.update(
+                "\x1f".join(
+                    [
+                        row["identifier"],
+                        str(row["position"]),
+                        row["name_text"],
+                        row["person_id"],
+                    ]
+                ).encode("utf-8")
+            )
+            digest.update(b"\x1e")
+        return digest.hexdigest()[:16]
+
+    def merge_version(self) -> str:
+        with self._lock:
+            return self._merge_version_locked()
+
+    def merge_state(self) -> dict[str, Any]:
+        """Everything the merge page shows, plus the version token for it.
+
+        Catalog, persons and assignments are read under the store lock, so a
+        concurrent harvest commit is either fully visible or not at all: a
+        person's bibliography always matches the same published catalogue.
+        """
+        with self._lock:
+            persons = [
+                dict(row)
+                for row in self._conn.execute(
+                    "SELECT id, display_name, created_at FROM persons ORDER BY id"
+                ).fetchall()
+            ]
+            names = {p["id"]: p["display_name"] for p in persons}
+            assignments: dict[tuple[str, int], sqlite3.Row] = {}
+            counts: dict[str, int] = {}
+            for row in self._conn.execute(
+                "SELECT identifier, position, person_id, name_text "
+                "FROM attributions"
+            ).fetchall():
+                assignments[(row["identifier"], row["position"])] = row
+                counts[row["person_id"]] = counts.get(row["person_id"], 0) + 1
+            bibliographies: dict[str, list[dict[str, Any]]] = {}
+            for row in self._conn.execute(
+                """
+                SELECT DISTINCT a.person_id AS person_id,
+                       c.identifier AS identifier,
+                       c.title AS title,
+                       c.source_datestamp AS source_datestamp
+                  FROM attributions a
+                  JOIN catalog c ON c.identifier = a.identifier
+                 ORDER BY c.title COLLATE NOCASE, c.identifier
+                """
+            ).fetchall():
+                bibliographies.setdefault(row["person_id"], []).append(
+                    {
+                        "identifier": row["identifier"],
+                        "title": row["title"],
+                        "source_datestamp": row["source_datestamp"],
+                    }
+                )
+            attributions: list[dict[str, Any]] = []
+            for rec in self._conn.execute(
+                "SELECT identifier, title, creator, source_datestamp FROM catalog "
+                "ORDER BY title COLLATE NOCASE, identifier"
+            ).fetchall():
+                for position, name in enumerate(split_creators(rec["creator"])):
+                    assignment = assignments.get((rec["identifier"], position))
+                    attributions.append(
+                        {
+                            "identifier": rec["identifier"],
+                            "title": rec["title"],
+                            "source_datestamp": rec["source_datestamp"],
+                            "position": position,
+                            "name_text": name,
+                            "person_id": (
+                                assignment["person_id"] if assignment else None
+                            ),
+                            "person_name": (
+                                names.get(assignment["person_id"])
+                                if assignment
+                                else None
+                            ),
+                        }
+                    )
+            for person in persons:
+                person["attribution_count"] = counts.get(person["id"], 0)
+                person["bibliography"] = bibliographies.get(person["id"], [])
+            return {
+                "version": self._merge_version_locked(),
+                "attributions": attributions,
+                "persons": persons,
+                "unassigned": sum(
+                    1 for item in attributions if item["person_id"] is None
+                ),
+            }
+
+    def _next_person_id_locked(self) -> str:
+        current = self._meta_get("person_seq")
+        number = int(current or "0") + 1
+        self._meta_set("person_seq", str(number))
+        return f"P{number:06d}"
+
+    def assign_attribution(
+        self,
+        *,
+        identifier: str,
+        position: int,
+        expected_version: str,
+        person_id: str | None = None,
+        new_person_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Attach one published attribution to a person (creating it if asked).
+
+        The whole check-and-set runs in a single IMMEDIATE transaction: the
+        ``expected_version`` must still describe what the user saw, the
+        attribution must exist in the published catalogue, and it must still
+        be unassigned (one attribution belongs to at most one person).  No
+        automatic merging by name ever happens here.
+        """
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                if self._merge_version_locked() != expected_version:
+                    self._conn.execute("ROLLBACK")
+                    return {"ok": False, "reason": "stale"}
+                record = self._conn.execute(
+                    "SELECT creator FROM catalog WHERE identifier = ?",
+                    (identifier,),
+                ).fetchone()
+                parts = split_creators(record["creator"]) if record else []
+                if record is None or not 0 <= position < len(parts):
+                    self._conn.execute("ROLLBACK")
+                    return {"ok": False, "reason": "missing"}
+                existing = self._conn.execute(
+                    "SELECT person_id FROM attributions "
+                    "WHERE identifier = ? AND position = ?",
+                    (identifier, position),
+                ).fetchone()
+                if existing is not None:
+                    self._conn.execute("ROLLBACK")
+                    return {
+                        "ok": False,
+                        "reason": "conflict",
+                        "person_id": existing["person_id"],
+                    }
+                created = False
+                if person_id is None:
+                    display = (
+                        (new_person_name or "").strip() or parts[position]
+                    )[:200]
+                    person_id = self._next_person_id_locked()
+                    self._conn.execute(
+                        "INSERT INTO persons (id, display_name, created_at) "
+                        "VALUES (?, ?, ?)",
+                        (person_id, display, utc_now_millis()),
+                    )
+                    created = True
+                elif (
+                    self._conn.execute(
+                        "SELECT 1 FROM persons WHERE id = ?", (person_id,)
+                    ).fetchone()
+                    is None
+                ):
+                    self._conn.execute("ROLLBACK")
+                    return {"ok": False, "reason": "no_person"}
+                self._conn.execute(
+                    "INSERT INTO attributions "
+                    "(identifier, position, name_text, person_id, assigned_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        identifier,
+                        position,
+                        parts[position],
+                        person_id,
+                        utc_now_millis(),
+                    ),
+                )
+                self._conn.execute("COMMIT")
+                return {
+                    "ok": True,
+                    "person_id": person_id,
+                    "created_person": created,
+                    "name_text": parts[position],
+                }
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def unassign_attribution(
+        self, *, identifier: str, position: int, expected_version: str
+    ) -> dict[str, Any]:
+        """Release one attribution from its person, with the same staleness
+        check as :meth:`assign_attribution`."""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                if self._merge_version_locked() != expected_version:
+                    self._conn.execute("ROLLBACK")
+                    return {"ok": False, "reason": "stale"}
+                existing = self._conn.execute(
+                    "SELECT person_id FROM attributions "
+                    "WHERE identifier = ? AND position = ?",
+                    (identifier, position),
+                ).fetchone()
+                if existing is None:
+                    self._conn.execute("ROLLBACK")
+                    return {"ok": False, "reason": "conflict"}
+                self._conn.execute(
+                    "DELETE FROM attributions "
+                    "WHERE identifier = ? AND position = ?",
+                    (identifier, position),
+                )
+                self._conn.execute("COMMIT")
+                return {"ok": True, "person_id": existing["person_id"]}
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
 
     def close(self) -> None:
         with self._lock:

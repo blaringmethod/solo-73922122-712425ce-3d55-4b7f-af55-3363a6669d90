@@ -3,13 +3,17 @@
 Pages
 -----
 ``/``                          catalogue browser, watermark, run controls
+``/people``                    署名归并：把已发布署名人工归到人物编号并列出人物书目
 ``/runs``                      round history (windows, attempts, restarts, errors)
 ``/status``                    statically rendered status JSON
 ``GET  /api/status``           polling endpoint used by the page
 ``GET  /api/catalog``          catalogue JSON (search + pagination)
+``GET  /api/people``           merge-page state JSON (attributions, persons, version)
 ``POST /api/harvest``          start a round
 ``POST /api/harvest/cancel``   cancel the active round without waiting for it
 ``POST /api/harvest/restart``  cancel (if any) and immediately start a new round
+``POST /people/assign``        attach one attribution to a person (version-checked)
+``POST /people/unassign``      release one attribution (version-checked)
 """
 
 from __future__ import annotations
@@ -18,9 +22,10 @@ import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, Form, HTTPException, Request, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -184,6 +189,104 @@ def create_app(
     @app.get("/api/catalog")
     async def api_catalog(q: str = "", page: int = 1, page_size: int = 20) -> JSONResponse:
         return JSONResponse(store.catalog_page(q, page, page_size))
+
+    # ------------------------------------------------------------- 署名归并
+    def people_view(
+        request: Request,
+        *,
+        message: str | None = None,
+        error: str | None = None,
+        status_code: int = 200,
+    ) -> HTMLResponse:
+        return templates.TemplateResponse(
+            request,
+            "people.html",
+            {
+                "state": store.merge_state(),
+                "published": store.published_state(),
+                "message": message,
+                "error": error,
+            },
+            status_code=status_code,
+        )
+
+    def people_reject(request: Request, result: dict[str, Any]) -> HTMLResponse:
+        """Refuse a stale or conflicting merge submit and show current data."""
+        reason = result.get("reason")
+        if reason == "stale":
+            error = (
+                "提交已过期：署名或归属在你打开页面后已变化。"
+                "以下展示当前数据，请核对后重新提交。"
+            )
+        elif reason == "missing":
+            error = "该署名在当前已发布目录中不存在。以下展示当前数据。"
+        elif reason == "conflict":
+            error = "该署名已有归属（一处署名只归一人）。以下展示当前数据。"
+        elif reason == "no_person":
+            error = "所选人物不存在。以下展示当前数据。"
+        else:
+            error = "提交被拒绝。以下展示当前数据。"
+        return people_view(request, error=error, status_code=409)
+
+    @app.get("/people", response_class=HTMLResponse)
+    async def people_page(
+        request: Request, message: str | None = None
+    ) -> HTMLResponse:
+        return people_view(request, message=message)
+
+    @app.get("/api/people")
+    async def api_people() -> JSONResponse:
+        return JSONResponse(store.merge_state())
+
+    @app.post("/people/assign")
+    async def people_assign(
+        request: Request,
+        identifier: str = Form(...),
+        position: int = Form(...),
+        person_id: str = Form("__new__"),
+        new_person_name: str = Form(""),
+        version: str = Form(""),
+    ) -> Response:
+        create_new = person_id == "__new__"
+        result = store.assign_attribution(
+            identifier=identifier,
+            position=position,
+            expected_version=version,
+            person_id=None if create_new else person_id,
+            new_person_name=new_person_name or None,
+        )
+        if not result["ok"]:
+            return people_reject(request, result)
+        if result["created_person"]:
+            message = (
+                f"已建立人物 {result['person_id']}（{result['name_text']}）"
+                f"并归并 {identifier} 第 {position + 1} 位署名"
+            )
+        else:
+            message = (
+                f"已把 {identifier} 第 {position + 1} 位署名"
+                f"「{result['name_text']}」归入人物 {result['person_id']}"
+            )
+        return RedirectResponse(
+            f"/people?message={quote(message)}", status_code=303
+        )
+
+    @app.post("/people/unassign")
+    async def people_unassign(
+        request: Request,
+        identifier: str = Form(...),
+        position: int = Form(...),
+        version: str = Form(""),
+    ) -> Response:
+        result = store.unassign_attribution(
+            identifier=identifier, position=position, expected_version=version
+        )
+        if not result["ok"]:
+            return people_reject(request, result)
+        message = f"已解除 {identifier} 第 {position + 1} 位署名的归属"
+        return RedirectResponse(
+            f"/people?message={quote(message)}", status_code=303
+        )
 
     return app
 

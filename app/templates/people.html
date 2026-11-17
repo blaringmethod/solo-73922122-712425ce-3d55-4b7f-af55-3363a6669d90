@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>署名归并</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div>
+    <h1>署名归并</h1>
+    <p class="sub">把已发布书目的署名（按分号拆分）归到具体人物 · 不按姓名自动合并</p>
+  </div>
+  <nav>
+    <a href="/">目录</a>
+    <a href="/people">署名归并</a>
+    <a href="/runs">轮次记录</a>
+    <a href="/status">状态 JSON</a>
+  </nav>
+</header>
+
+{% if message %}<div class="flash">{{ message }}</div>{% endif %}
+{% if error %}<div class="flash error">{{ error }}</div>{% endif %}
+
+<main class="layout">
+  <section class="panel grow">
+    <div class="panel-head">
+      <h2>已发布目录的署名</h2>
+      <span class="muted small">数据版本 <code>{{ state.version }}</code> · 提交前请核对此页所见署名与归属</span>
+    </div>
+
+    <div class="meta-grid">
+      <div><span class="label">已发布目录</span><strong>{{ published.catalog_size }} 条</strong></div>
+      <div><span class="label">署名总数</span><strong>{{ state.attributions|length }} 处</strong></div>
+      <div><span class="label">未归属</span><strong>{{ state.unassigned }} 处</strong></div>
+      <div><span class="label">人物</span><strong>{{ state.persons|length }} 位</strong></div>
+    </div>
+
+    <table class="records">
+      <thead>
+        <tr><th>标识</th><th>标题</th><th>序位</th><th>署名</th><th>归属</th><th>操作</th></tr>
+      </thead>
+      <tbody>
+      {% for item in state.attributions %}
+        <tr>
+          <td class="mono small">{{ item.identifier }}</td>
+          <td>{{ item.title }}</td>
+          <td>第 {{ item.position + 1 }} 位</td>
+          <td>{{ item.name_text }}</td>
+          <td>
+            {% if item.person_id %}
+              <span class="tag">{{ item.person_id }}</span> {{ item.person_name }}
+            {% else %}
+              <span class="muted">未归属</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if item.person_id %}
+            <form method="post" action="/people/unassign" class="inline-form">
+              <input type="hidden" name="identifier" value="{{ item.identifier }}">
+              <input type="hidden" name="position" value="{{ item.position }}">
+              <input type="hidden" name="version" value="{{ state.version }}">
+              <button type="submit" class="danger">解除归属</button>
+            </form>
+            {% else %}
+            <form method="post" action="/people/assign" class="inline-form">
+              <input type="hidden" name="identifier" value="{{ item.identifier }}">
+              <input type="hidden" name="position" value="{{ item.position }}">
+              <input type="hidden" name="version" value="{{ state.version }}">
+              <select name="person_id">
+                <option value="__new__" selected>＋ 新建人物</option>
+                {% for person in state.persons %}
+                <option value="{{ person.id }}">{{ person.id }} {{ person.display_name }}</option>
+                {% endfor %}
+              </select>
+              <input type="text" name="new_person_name" placeholder="新人物名（留空用署名）" size="16" maxlength="200">
+              <button type="submit" class="primary">归并</button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
+      {% else %}
+        <tr><td colspan="6" class="empty">已发布目录中还没有署名。先在<a href="/">目录页</a>成功采集一轮。</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <p class="hint">每次提交都携带本页数据版本；若提交时数据已变化（采集发布或他人归并），
+    提交会被拒绝并展示当前数据。</p>
+  </section>
+
+  <aside class="panel">
+    <h2>人物与书目</h2>
+    {% for person in state.persons %}
+    <div class="person-card">
+      <div class="person-head">
+        <span class="tag">{{ person.id }}</span>
+        <strong>{{ person.display_name }}</strong>
+        <span class="muted small">署名 {{ person.attribution_count }} 处 · 书目 {{ person.bibliography|length }} 条</span>
+      </div>
+      {% if person.bibliography %}
+      <ul class="biblio">
+        {% for work in person.bibliography %}
+        <li><span class="mono small">{{ work.identifier }}</span> {{ work.title }}</li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <p class="muted small">（暂无书目：署名被解除或采集撤回后，人物编号保留。）</p>
+      {% endif %}
+    </div>
+    {% else %}
+    <p class="muted">还没有人物。在左侧选择一处署名，点“归并”即可建立人物编号。</p>
+    {% endfor %}
+    <p class="hint">规则：一处署名只归一人；不按姓名自动合并。成功采集若改动某条书目的作者
+    顺序或姓名，只保留序位与文字都未变的归属；撤回会解除该书目全部归属，之后同名恢复
+    也不会复活旧归属；重复采集到未变化的署名则保持归属。失败或被取消的采集不改动归属。</p>
+  </aside>
+</main>
+</body>
+</html>

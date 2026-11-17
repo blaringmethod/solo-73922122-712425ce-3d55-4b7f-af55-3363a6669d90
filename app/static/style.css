@@ -49,6 +49,7 @@ a:hover { text-decoration: underline; }
   margin: 14px 28px 0; padding: 10px 14px; border-radius: 8px;
   background: #fff7e6; border: 1px solid #f0d9a8; color: #6b4a08;
 }
+.flash.error { background: #fdecea; border-color: #e3b3ad; color: #7a1f14; }
 
 .meta-grid {
   display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
@@ -105,3 +106,23 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .muted { color: var(--muted); }
 .pager { display: flex; gap: 16px; align-items: center; justify-content: center; padding: 14px 0 2px; font-size: 14px; }
 pre { white-space: pre-wrap; word-break: break-word; font-size: 12.5px; background: #f8fafc; padding: 14px; border-radius: 8px; }
+
+/* 署名归并页 */
+.tag {
+  display: inline-block; padding: 1px 7px; border-radius: 4px;
+  background: #e4efff; color: #1d56b5; font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.inline-form { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.inline-form select, .inline-form input[type=text] {
+  padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px;
+  font-size: 13px; background: #fff;
+}
+.inline-form button { padding: 6px 10px; font-size: 13px; }
+.person-card {
+  border: 1px solid var(--line); border-radius: 8px;
+  padding: 10px 12px; margin-bottom: 10px;
+}
+.person-head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.biblio { margin: 8px 0 0; padding-left: 18px; font-size: 13px; }
+.biblio li { margin-bottom: 4px; }
